@@ -7,16 +7,16 @@
     <material name="black" rgba="0.2 0.2 0.2 1"/>
     <material name="white" rgba="1 1 1 1"/>
 
-    <mesh name="palm" file="palm_right.obj"/>
-    <mesh name="base" file="base.obj"/>
-    <mesh name="proximal" file="proximal.obj"/>
-    <mesh name="medial" file="medial.obj"/>
-    <mesh name="distal" file="distal.obj"/>
-    <mesh name="tip" file="tip.obj"/>
-    <mesh name="thumb_base" file="thumb_base.obj"/>
-    <mesh name="thumb_proximal" file="thumb_proximal.obj"/>
-    <mesh name="thumb_distal" file="thumb_distal.obj"/>
-    <mesh name="thumb_tip" file="thumb_tip.obj"/>
+    <mesh name="palm" file="palm_right.stl"/>
+    <mesh name="base" file="base.stl"/>
+    <mesh name="proximal" file="proximal.stl"/>
+    <mesh name="medial" file="medial.stl"/>
+    <mesh name="distal" file="distal.stl"/>
+    <mesh name="tip" file="tip.stl"/>
+    <mesh name="thumb_base" file="thumb_base.stl"/>
+    <mesh name="thumb_proximal" file="thumb_proximal.stl"/>
+    <mesh name="thumb_distal" file="thumb_distal.stl"/>
+    <mesh name="thumb_tip" file="thumb_tip.stl"/>
   </asset>
 
   <!-- defaults -->

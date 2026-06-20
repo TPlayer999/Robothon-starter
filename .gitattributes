@@ -1,2 +1,2 @@
 # Large MuJoCo meshes are data assets, not reviewable source text.
-submissions/tactile-dex-leap/assets/leap_hand/assets/*.obj binary
+submissions/tactile-dex-leap/assets/leap_hand/assets/*.stl binary
