@@ -85,13 +85,61 @@ def main() -> int:
         results = run(env, policy_fn, args.episodes, args.deterministic)
     elif args.model:
         from stable_baselines3 import PPO
+        from stable_baselines3.common.vec_env import VecNormalize, DummyVecEnv
         print(f"Loading policy {args.model} ...")
         model = PPO.load(args.model, device="cpu")
+        # The trained model expects VecNormalize-normalized observations; wrap
+        # the env the same way and load the saved running stats if present.
+        vecnorm_path = args.model.parent / "ppo_leap_dex_vecnorm.pkl"
+        vec_env = VecNormalize(DummyVecEnv([lambda: env]), training=False, norm_reward=False)
+        if vecnorm_path.exists():
+            vec_env = VecNormalize.load(str(vecnorm_path), vec_env.venv)
+            vec_env.training = False
+            vec_env.norm_reward = False
+            print(f"  loaded VecNormalize stats from {vecnorm_path.name}")
+        else:
+            print("  WARNING: no VecNormalize stats found; obs may be mis-scaled.")
 
         def policy_fn(obs, step, max_steps):
             a, _ = model.predict(obs, deterministic=args.deterministic)
             return a
-        results = run(env, policy_fn, args.episodes, args.deterministic)
+
+        # Custom rollout that normalizes obs before predict (VecNormalize wraps
+        # the env; we drive it step-by-step through the wrapper).
+        rewards, aligns, touches, solves, drops, lengths = [], [], [], 0, 0, []
+        for ep in range(args.episodes):
+            obs_raw, info = env.reset(seed=1000 + ep)
+            obs = vec_env.normalize_obs(np.asarray(obs_raw)[None, :])[0]
+            ep_reward = 0.0
+            step = 0
+            done = False
+            while not done:
+                action, _ = model.predict(obs, deterministic=args.deterministic)
+                # action from VecNormalize-normalized policy is in normalized space already
+                obs_raw, r, term, trunc, info = env.step(np.asarray(action))
+                obs = vec_env.normalize_obs(np.asarray(obs_raw)[None, :])[0]
+                ep_reward += r
+                step += 1
+                done = term or trunc
+            rewards.append(ep_reward)
+            aligns.append(info["align"])
+            touches.append(info["n_touching"])
+            lengths.append(step)
+            if info["solved"]:
+                solves += 1
+            if info["dropped"]:
+                drops += 1
+        results = {
+            "episodes": args.episodes,
+            "mean_reward": float(np.mean(rewards)),
+            "std_reward": float(np.std(rewards)),
+            "mean_align": float(np.mean(aligns)),
+            "max_align": float(np.max(aligns)),
+            "mean_touch": float(np.mean(touches)),
+            "solve_rate": solves / args.episodes,
+            "drop_rate": drops / args.episodes,
+            "mean_len": float(np.mean(lengths)),
+        }
     else:
         print("Specify --model <zip> or --baseline grasp")
         return 1

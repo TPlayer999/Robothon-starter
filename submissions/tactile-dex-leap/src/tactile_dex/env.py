@@ -54,21 +54,31 @@ class EnvConfig:
     action_substeps: int = 4  # physics steps per env step (dt=0.002 -> 8ms)
 
     # Reward weights.
-    w_align: float = 1.0
-    w_grasp: float = 0.3
+    w_align: float = 1.0       # quadratic alignment (align**2 for steeper gradient)
+    w_grasp: float = 0.4       # contact count bonus (saturates at 4 fingers)
     w_alive: float = 0.02
-    w_ctrl: float = 0.005
-    w_drop: float = -2.0
+    w_ctrl: float = 0.005      # action-delta smoothness
+    w_drop: float = -2.0       # terminal drop penalty (now actually applied)
     w_reach_align: float = 5.0  # terminal bonus when target reached
+    w_pbrs: float = 0.5        # potential-based shaping (fingertip-to-cube distance)
+    w_height: float = 0.3      # keep cube near a target height (height stability)
+    w_angvel: float = 0.01     # penalize flinging the cube (cube angular velocity)
+    w_force: float = 0.05      # reward total contact force magnitude (not just count)
 
     # Thresholds.
     touch_threshold: float = 0.5  # Newtons; below this a fingertip is "off"
     drop_z: float = 0.02  # cube centre below this = dropped
+    target_z: float = 0.085  # nominal held cube height (for height-stability reward)
     align_success: float = 0.95  # alignment (in [0,1]) considered "solved"
 
     # Grasp-assist curriculum.
     use_weld_curriculum: bool = True
     weld_steps: int = 40  # first N steps of each episode keep the weld on
+
+    # Domain randomization (sim2real relevance + robustness).
+    friction_noise: float = 0.0   # +/- fraction applied to cube/tip friction each reset
+    mass_noise: float = 0.0       # +/- fraction applied to cube mass each reset
+    touch_noise: float = 0.0      # Gaussian std (N) added to touch readings
 
     # Randomisation on reset.
     cube_pos_noise: float = 0.012
@@ -128,7 +138,21 @@ class InHandCubeEnv(gym.Env):
         self._cube_freejoint_qadr = self.model.jnt_qposadr[
             mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, "cube_freejoint")
         ]
+        self._cube_dofadr = self.model.jnt_dofadr[
+            mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, "cube_freejoint")
+        ]
         self._eq_weld = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_EQUALITY, "grasp_weld")
+        self._fingertip_bodies = [
+            mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, n)
+            for n in ("if_ds", "mf_ds", "rf_ds", "th_ds")
+        ]
+        # nominal cube mass/friction for domain randomization (re-applied per reset).
+        self._nominal_cube_mass = float(self.model.body_mass[self._cube_body])
+        self._nominal_cube_friction = np.asarray(
+            self.model.geom_friction[
+                mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, "cube_geom")
+            ]
+        ).copy()
 
         # Actuator ctrl ranges -> action space in [-1, 1] (rescaled before apply).
         ctrl_low = self.model.actuator_ctrlrange[:, 0].astype(np.float32)
@@ -137,9 +161,11 @@ class InHandCubeEnv(gym.Env):
         self._ctrl_high = ctrl_high
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(16,), dtype=np.float32)
 
-        # Observation: joint pos(16) + joint vel(16) + cube pos(3) + cube
-        # quat(4) + target quat(4) + touch(4) = 47 floats.
-        obs_dim = 16 + 16 + 3 + 4 + 4 + 4
+        # Observation (rich, 57-dim):
+        #   joint pos(16) + joint vel(16) + cube pos(3) + cube quat(4)
+        #   + relative quat err q_target⊗q_cube⁻¹ (4) + cube linvel(3)
+        #   + cube angvel(3) + touch(4) + fingertip-to-cube dist(4) = 57
+        obs_dim = 16 + 16 + 3 + 4 + 4 + 3 + 3 + 4 + 4
         self.observation_space = spaces.Box(
             low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32
         )
@@ -147,6 +173,7 @@ class InHandCubeEnv(gym.Env):
         self._target_quat = np.array([1.0, 0.0, 0.0, 0.0])
         self._step_count = 0
         self._last_action = np.zeros(16, dtype=np.float32)
+        self._last_potential = 0.0  # for potential-based reward shaping (PBRS)
         self._renderer = None
 
         # Gymnasium boilerplate.
@@ -182,17 +209,65 @@ class InHandCubeEnv(gym.Env):
             self._ctrl_low + (action.astype(np.float32) + 1.0) * 0.5 * (self._ctrl_high - self._ctrl_low)
         )
 
+    def _apply_domain_randomization(self) -> None:
+        """Randomize cube friction/mass each reset if configured (sim2real)."""
+        ec = self.env_config
+        if ec.friction_noise > 0.0 or ec.mass_noise > 0.0:
+            rng = self.np_random
+            cube_g = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, "cube_geom")
+            if ec.mass_noise > 0.0:
+                m = self._nominal_cube_mass * (1.0 + rng.uniform(-ec.mass_noise, ec.mass_noise))
+                self.model.body_mass[self._cube_body] = m
+            if ec.friction_noise > 0.0:
+                f = self._nominal_cube_friction * (1.0 + rng.uniform(-ec.friction_noise, ec.friction_noise, size=3))
+                self.model.geom_friction[cube_g] = f
+
+    def _cube_velocity(self) -> tuple[np.ndarray, np.ndarray]:
+        """Cube linear (world) and angular (world) velocity from the free joint."""
+        a = self._cube_dofadr
+        linvel = self.data.qvel[a:a + 3].copy()
+        angvel = self.data.qvel[a + 3:a + 6].copy()
+        return linvel, angvel
+
+    def _fingertip_to_cube_dist(self) -> np.ndarray:
+        """Euclidean distance from each fingertip body origin to the cube centre."""
+        cube_pos = self.data.xpos[self._cube_body]
+        return np.array(
+            [np.linalg.norm(self.data.xpos[bid] - cube_pos) for bid in self._fingertip_bodies],
+            dtype=np.float32,
+        )
+
+    def _potential(self) -> float:
+        """Potential function for PBRS: high when fingers are close to the cube
+        and the cube is held near the target height."""
+        ec = self.env_config
+        mean_dist = float(np.mean(self._fingertip_to_cube_dist()))
+        cube_pos = self.data.xpos[self._cube_body]
+        height_err = abs(float(cube_pos[2]) - ec.target_z)
+        return -(mean_dist + 0.5 * height_err)
+
     def _build_obs(self) -> np.ndarray:
         pos, quat = self._cube_pose()
+        linvel, angvel = self._cube_velocity()
         touch = touch_values(self.model, self.data).astype(np.float32)
+        if self.env_config.touch_noise > 0.0:
+            touch = touch + self.np_random.normal(0.0, self.env_config.touch_noise, size=4).astype(np.float32)
+        # relative quaternion error q_err = q_target ⊗ q_cube⁻¹ (canonical form)
+        q_err = _quat_mul(self._target_quat.astype(np.float64), _quat_conj(quat.astype(np.float64)))
+        if q_err[0] < 0:
+            q_err = -q_err  # canonical positive-w
+        ftip_dist = self._fingertip_to_cube_dist()
         obs = np.concatenate(
             [
                 self._joint_qpos().astype(np.float32),
                 self._joint_qvel().astype(np.float32),
                 pos.astype(np.float32),
                 quat.astype(np.float32),
-                self._target_quat.astype(np.float32),
+                q_err.astype(np.float32),
+                linvel.astype(np.float32),
+                angvel.astype(np.float32),
                 touch,
+                ftip_dist,
             ]
         )
         return obs
@@ -233,11 +308,13 @@ class InHandCubeEnv(gym.Env):
             self._target_quat = np.array([1.0, 0.0, 0.0, 0.0])
 
         # Grasp-assist curriculum: weld on for the first few steps.
+        self._apply_domain_randomization()
         self._set_weld(ec.use_weld_curriculum)
         mujoco.mj_forward(self.model, self.data)
 
         self._step_count = 0
         self._last_action = np.zeros(16, dtype=np.float32)
+        self._last_potential = self._potential()  # init PBRS baseline
         return self._build_obs(), {"target_quat": self._target_quat.copy()}
 
     def step(self, action: np.ndarray):
@@ -255,24 +332,40 @@ class InHandCubeEnv(gym.Env):
 
         self._step_count += 1
 
-        # ---- reward ----
-        _, cube_quat = self._cube_pose()
+        # ---- reward (dense, multi-term) ----
+        cube_pos, cube_quat = self._cube_pose()
         align = _quat_align(cube_quat, self._target_quat)
         touch = touch_values(self.model, self.data)
         n_touching = int(np.sum(touch > ec.touch_threshold))
+        total_force = float(np.sum(np.clip(touch, 0.0, None)))
+        linvel, angvel = self._cube_velocity()
 
-        grasp_bonus = ec.w_grasp * min(1.0, n_touching / 2.0)
-        align_bonus = ec.w_align * align
+        # Quadratic alignment: steeper gradient near the target (the hard part).
+        align_bonus = ec.w_align * (align ** 2)
+        # Grasp: reward scales up to 4 contacting fingers (cages prevent drops).
+        grasp_bonus = ec.w_grasp * min(1.0, n_touching / 4.0)
+        force_bonus = ec.w_force * min(1.0, total_force / 4.0)
         alive_bonus = ec.w_alive
         ctrl_cost = ec.w_ctrl * float(np.sum((action - self._last_action) ** 2))
-        reward = align_bonus + grasp_bonus + alive_bonus - ctrl_cost
+        # Penalize flinging: cube angular velocity magnitude.
+        angvel_cost = ec.w_angvel * float(np.linalg.norm(angvel))
+        # Height stability: reward keeping the cube near the held target height.
+        height_bonus = ec.w_height * max(0.0, 1.0 - abs(float(cube_pos[2]) - ec.target_z) / 0.05)
+        # Potential-based reward shaping (PBRS) — keeps optimality, makes progress visible.
+        new_potential = self._potential()
+        pbrs = ec.w_pbrs * (new_potential - self._last_potential)
+        self._last_potential = new_potential
+
+        reward = (align_bonus + grasp_bonus + force_bonus + alive_bonus
+                  + height_bonus + pbrs - ctrl_cost - angvel_cost)
         self._last_action = action.copy()
 
         # ---- termination ----
-        cube_pos, _ = self._cube_pose()
         dropped = bool(cube_pos[2] < ec.drop_z)
         solved = bool(align >= ec.align_success)
         terminated = dropped
+        if dropped:
+            reward += ec.w_drop  # FIX dead code: now the drop penalty actually applies.
         if solved:
             reward += ec.w_reach_align
             terminated = True
@@ -314,6 +407,23 @@ class InHandCubeEnv(gym.Env):
 def _yaw_quat(yaw: float) -> np.ndarray:
     half = yaw * 0.5
     return np.array([math.cos(half), 0.0, 0.0, math.sin(half)])
+
+
+def _quat_conj(q: np.ndarray) -> np.ndarray:
+    """Quaternion conjugate (== inverse for unit quaternions)."""
+    return np.array([q[0], -q[1], -q[2], -q[3]])
+
+
+def _quat_mul(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """Hamilton product a ⊗ b (w,x,y,z convention)."""
+    w1, x1, y1, z1 = a
+    w2, x2, y2, z2 = b
+    return np.array([
+        w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+        w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+        w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+        w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+    ])
 
 
 def _random_target_quat(rng: np.random.Generator) -> np.ndarray:

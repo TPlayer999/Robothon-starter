@@ -52,8 +52,10 @@ class SceneConfig:
     palm_pos: tuple[float, float, float] = (0.0, 0.0, 0.1)
     palm_quat: tuple[float, float, float, float] = (1.0, 0.0, 0.0, 0.0)
 
-    # Cube (manipulated object).
-    cube_size: float = 0.022  # half-side; ~4.4 cm cube, graspable by LEAP.
+    # Manipulated object. "cube" is the training object; the demo can switch to
+    # sphere / cylinder / bottle to show the hand generalizing across shapes.
+    object_type: str = "cube"  # cube | sphere | cylinder | bottle
+    cube_size: float = 0.022  # half-side (cube) / radius (sphere) / etc.
     cube_mass: float = 0.060
     cube_friction: tuple[float, float, float] = (1.0, 0.005, 0.0001)
 
@@ -73,10 +75,10 @@ class SceneConfig:
     render_width: int = 1280
     render_height: int = 720
 
-    # Optional soft "grasp assist" weld between cube and palm. Disabled by
-    # default; the env flips ``model.eq_active0`` for the scripted baseline.
+    # Optional "grasp assist" weld between cube and palm. The env toggles it per
+    # episode for the curriculum; the CurriculumCallback in train.py anneals
+    # weld_steps (rigid weld length) from long -> 0 over the first training window.
     use_grasp_weld: bool = True
-    weld_stiffness: float = 0.0  # 0 = rigid weld; >0 = springy
 
 
 def _add_fingertip_touch(spec: mujoco.MjSpec, body_name: str, finger_label: str) -> None:
@@ -161,22 +163,33 @@ def build_scene(config: SceneConfig | None = None) -> tuple[mujoco.MjModel, dict
         rgba=[0.08, 0.09, 0.11, 1.0],
     )
 
-    # 3) The manipulated cube (free-floating body with a free joint).
+    # 3) The manipulated object (free-floating body with a free joint).
+    obj_type = config.object_type
+    s = config.cube_size
+    if obj_type == "sphere":
+        geom_kw = dict(type=mujoco.mjtGeom.mjGEOM_SPHERE, size=[s])
+    elif obj_type == "cylinder":
+        geom_kw = dict(type=mujoco.mjtGeom.mjGEOM_CYLINDER, size=[s * 0.8, s * 1.4])
+    elif obj_type == "bottle":
+        # a capsule reads as a bottle/pen — graspable along its long axis.
+        geom_kw = dict(type=mujoco.mjtGeom.mjGEOM_CAPSULE, size=[s * 0.7, s * 1.8])
+    else:  # cube (default)
+        geom_kw = dict(type=mujoco.mjtGeom.mjGEOM_BOX,
+                       size=[s, s, s])
     cube = world.add_body(
-        name="cube",
+        name="cube",  # name kept as "cube" so the env indexing is unchanged
         pos=list(config.cube_spawn_pos),
     )
     cube.add_freejoint(name="cube_freejoint")
     cube.add_geom(
         name="cube_geom",
-        type=mujoco.mjtGeom.mjGEOM_BOX,
-        size=[config.cube_size, config.cube_size, config.cube_size],
         mass=config.cube_mass,
         friction=list(config.cube_friction),
         condim=3,
         solref=(0.02, 1.0),
         solimp=(0.9, 0.95, 0.001, 0.5, 2.0),
         rgba=[1.0, 0.55, 0.15, 1.0],
+        **geom_kw,
     )
     # Coloured target ghost (visual-only) so the demo can show the goal pose.
     target = world.add_body(

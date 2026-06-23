@@ -1,4 +1,4 @@
-# TACTILE-DEX default training configuration.
+# TACTILE-DEX MAX default training configuration.
 # All paths are relative to the submission root (submissions/tactile-dex-leap/).
 
 env:
@@ -9,34 +9,49 @@ env:
   target_is_random: true
 
 reward:
-  w_align: 1.0
-  w_grasp: 0.3
+  w_align: 1.0          # quadratic alignment (align**2, steep gradient near target)
+  w_grasp: 0.4          # contact-count bonus (saturates at 4 fingers)
   w_alive: 0.02
   w_ctrl: 0.005
-  w_drop: -2.0
+  w_drop: -2.0          # terminal drop penalty (now actually applied)
   w_reach_align: 5.0
+  w_pbrs: 0.5           # potential-based shaping (fingertip-to-cube distance)
+  w_height: 0.3         # keep cube near the held target height
+  w_angvel: 0.01        # penalize flinging (cube angular velocity)
+  w_force: 0.05         # reward total contact force magnitude
   touch_threshold: 0.5
   drop_z: 0.02
   align_success: 0.95
+  friction_noise: 0.15  # +/- 15% cube friction per reset (sim2real robustness)
+  mass_noise: 0.10      # +/- 10% cube mass per reset
+  touch_noise: 0.03     # Gaussian std (N) added to touch readings
+
+curriculum:
+  weld_start_steps: 120  # weld holds for the whole episode early on (easy: rotate glued)
+  weld_end_steps: 0      # then shrink to nothing (must hold by real contacts)
+  weld_anneal_steps: 1500000  # anneal over the first 1.5M timesteps
 
 ppo:
   policy: "MlpPolicy"
   policy_kwargs:
     net_arch: [256, 256]
-  learning_rate: 3.0e-4
+  learning_rate: "linear:3.0e-4"   # linear decay to 0
   n_steps: 4096
   batch_size: 256
-  n_epochs: 10
+  n_epochs: 4            # lower than 10 -> less policy collapse
   gamma: 0.99
   gae_lambda: 0.95
-  clip_range: 0.2
+  clip_range: "linear:0.2"         # linear decay to 0
   ent_coef: 0.01
-  device: "cpu"   # Apple Silicon: sb3 PPO runs CPU-only (MPS unsupported)
+  target_kl: 0.03        # early-stop epochs when the policy moved too far
+  use_sde: true          # generalized State Dependent Exploration
+  sde_sample_freq: 4
+  device: "cpu"          # Apple Silicon: sb3 PPO runs CPU-only (MPS unsupported)
 
 train:
-  total_timesteps: 2000000
+  total_timesteps: 3000000
   n_envs: 8
-  checkpoint_every: 100000
+  checkpoint_every: 500000
   log_dir: "runs"
   model_dir: "models"
   model_name: "ppo_leap_dex"

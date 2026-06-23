@@ -80,6 +80,7 @@ class Overlay:
         title: str,
         step: int,
         max_steps: int,
+        pip_frame: np.ndarray | None = None,
     ) -> np.ndarray:
         # One axes in [0,1] x [0,1] so every overlay element (image + patches
         # + text) shares the same fractional coordinate system. imshow extent
@@ -134,6 +135,18 @@ class Overlay:
         ))
         ax.text(0.025, 0.06, f"step {step}/{max_steps}", color="#9fb0c0",
                 fontsize=8, fontfamily="monospace", zorder=7)
+
+        # Picture-in-picture top-down inset (top-right corner) so the viewer
+        # sees the grasp from two angles at once.
+        if pip_frame is not None:
+            pip_w, pip_h = 0.22, 0.22 * (self.w / self.h)
+            px0, py0 = 1.0 - pip_w - 0.015, 1.0 - pip_h - 0.085
+            ax.imshow(pip_frame, extent=(px0, px0 + pip_w, py0, py0 + pip_h),
+                      aspect="auto", zorder=8)
+            ax.add_patch(Rectangle((px0, py0), pip_w, pip_h, fill=False,
+                                   edgecolor="#cfe8ff", linewidth=1.5, zorder=9))
+            ax.text(px0, py0 - 0.012, "TOP VIEW", color="#9fc7e8",
+                    fontsize=7, fontfamily="monospace", zorder=9)
 
         # Render to a numpy array via savefig into an in-memory buffer for a
         # robust grab (buffer_rgba can miss patches on some backends).
@@ -213,10 +226,31 @@ def make_policy(kind: str, model_path: Path | None):
 
     if kind == "model" and model_path is not None:
         from stable_baselines3 import PPO
+        from stable_baselines3.common.vec_env import VecNormalize, DummyVecEnv
         m = PPO.load(model_path, device="cpu")
+        # The trained policy expects VecNormalize-normalized observations.
+        vecnorm_path = model_path.parent / "ppo_leap_dex_vecnorm.pkl"
+
+        class _NormObs:
+            def __init__(self, path):
+                if path.exists():
+                    # build a throwaway wrapper just to load running stats
+                    base = InHandCubeEnv(env_config=EnvConfig())
+                    self.vn = VecNormalize.load(str(path), DummyVecEnv([lambda: base]))
+                    self.vn.training = False
+                    self.vn.norm_reward = False
+                else:
+                    self.vn = None
+
+            def __call__(self, obs):
+                if self.vn is None:
+                    return obs
+                return self.vn.normalize_obs(np.asarray(obs, dtype=np.float32)[None, :])[0]
+
+        norm = _NormObs(vecnorm_path)
 
         def learned(obs, step, max_steps, act):
-            a, _ = m.predict(obs, deterministic=True)
+            a, _ = m.predict(norm(obs), deterministic=True)
             return a
         return learned
 
@@ -240,6 +274,8 @@ def run_act(
     title: str,
     frames_out: list,
     traj_out: list,
+    pip_renderer: mujoco.Renderer | None = None,
+    pip_cam: mujoco.MjvCamera | None = None,
 ):
     obs, info = env.reset(seed=abs(hash(act)) % 100000)
     target_quat = info["target_quat"].copy()
@@ -263,9 +299,17 @@ def run_act(
         set_camera(cam, act, fi / fps, n_frames / fps, cube_pos)
         renderer.update_scene(env.data, camera=cam)
         frame = renderer.render().copy()
+
+        # Picture-in-picture: a second renderer looking straight down at the hand.
+        pip_frame = None
+        if pip_renderer is not None:
+            pip_cam.lookat[:] = [0.05, 0.0, 0.09]
+            pip_renderer.update_scene(env.data, camera=pip_cam)
+            pip_frame = pip_renderer.render().copy()
+
         comp = overlay.composite(
             frame, touch=touch, align=align, act=act, title=title,
-            step=fi, max_steps=n_frames,
+            step=fi, max_steps=n_frames, pip_frame=pip_frame,
         )
         frames_out.append(comp)
         if fi % max(1, fps // 6) == 0:
@@ -290,6 +334,8 @@ def main() -> int:
     ap.add_argument("--height", type=int, default=540)
     ap.add_argument("--act-frames", type=int, default=300,
                     help="Frames per act (approx; ~30s total at fps=30)")
+    ap.add_argument("--object", choices=("cube", "sphere", "cylinder", "bottle"),
+                    default="cube", help="Manipulated object shape")
     return _run(ap.parse_args())
 
 
@@ -305,12 +351,23 @@ def _run(args) -> int:
         policy = make_policy("scripted", None)
         title_suffix = "(scripted baseline)"
 
-    scene_cfg = SceneConfig(render_width=args.width, render_height=args.height)
+    scene_cfg = SceneConfig(render_width=args.width, render_height=args.height,
+                            object_type=args.object)
     env = InHandCubeEnv(scene_config=scene_cfg, env_config=EnvConfig(),
                         render_mode="rgb_array")
     renderer = mujoco.Renderer(env.model, width=args.width, height=args.height)
     cam = mujoco.MjvCamera()
     overlay = Overlay(args.width, args.height)
+
+    # Picture-in-picture top-down renderer (smaller for speed).
+    pip_w, pip_h = max(240, args.width // 4), max(180, args.height // 4)
+    pip_renderer = mujoco.Renderer(env.model, width=pip_w, height=pip_h)
+    pip_cam = mujoco.MjvCamera()
+    pip_cam.type = mujoco.mjtCamera.mjCAMERA_FREE
+    pip_cam.lookat = [0.05, 0.0, 0.09]
+    pip_cam.distance = 0.16
+    pip_cam.azimuth = 0.0
+    pip_cam.elevation = -89.0  # look straight down
 
     frames: list[np.ndarray] = []
     traj: list[dict] = []
@@ -319,13 +376,16 @@ def _run(args) -> int:
 
     t0 = run_act(env, policy, overlay, renderer, cam,
                  act="intro", n_frames=n // 3, fps=args.fps, substeps=2,
-                 title="TACTILE-DEX", frames_out=frames, traj_out=traj)
+                 title="TACTILE-DEX", frames_out=frames, traj_out=traj,
+                 pip_renderer=pip_renderer, pip_cam=pip_cam)
     _ = run_act(env, policy, overlay, renderer, cam,
                 act="reorient", n_frames=n // 3, fps=args.fps, substeps=2,
-                title="In-Hand Reorientation", frames_out=frames, traj_out=traj)
+                title="In-Hand Reorientation", frames_out=frames, traj_out=traj,
+                pip_renderer=pip_renderer, pip_cam=pip_cam)
     _ = run_act(env, policy, overlay, renderer, cam,
                 act="grasp", n_frames=n - 2 * (n // 3), fps=args.fps, substeps=2,
-                title="Grasp & Lift", frames_out=frames, traj_out=traj)
+                title="Grasp & Lift", frames_out=frames, traj_out=traj,
+                pip_renderer=pip_renderer, pip_cam=pip_cam)
 
     summary = {
         "project": "TACTILE-DEX: Tactile In-Hand Manipulation with LEAP Hand",

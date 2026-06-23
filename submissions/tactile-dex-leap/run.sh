@@ -51,7 +51,7 @@ case "${cmd}" in
         ;;
     train)
         [ -x "${PY}" ] || setup_venv
-        TSTEPS="${TSTEPS:-2000000}"; NENV="${NENV:-6}"
+        TSTEPS="${TSTEPS:-3000000}"; NENV="${NENV:-8}"
         "${PY}" train.py --timesteps "${TSTEPS}" --n-envs "${NENV}"
         ;;
     eval)

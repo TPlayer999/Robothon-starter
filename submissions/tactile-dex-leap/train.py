@@ -22,8 +22,9 @@ import numpy as np
 import yaml
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import BaseCallback
-from stable_baselines3.common.vec_env import SubprocVecEnv, VecEnv
+from stable_baselines3.common.vec_env import SubprocVecEnv, VecEnv, VecNormalize
 from stable_baselines3.common.utils import set_random_seed
+from stable_baselines3.common.utils import LinearSchedule
 
 # Make ``tactile_dex`` importable when running the script from the submission
 # root without installing the package.
@@ -49,14 +50,21 @@ def env_config_from_yaml(cfg: dict) -> EnvConfig:
         weld_steps=e.get("weld_steps", 40),
         target_is_random=e.get("target_is_random", True),
         w_align=r.get("w_align", 1.0),
-        w_grasp=r.get("w_grasp", 0.3),
+        w_grasp=r.get("w_grasp", 0.4),
         w_alive=r.get("w_alive", 0.02),
         w_ctrl=r.get("w_ctrl", 0.005),
         w_drop=r.get("w_drop", -2.0),
         w_reach_align=r.get("w_reach_align", 5.0),
+        w_pbrs=r.get("w_pbrs", 0.5),
+        w_height=r.get("w_height", 0.3),
+        w_angvel=r.get("w_angvel", 0.01),
+        w_force=r.get("w_force", 0.05),
         touch_threshold=r.get("touch_threshold", 0.5),
         drop_z=r.get("drop_z", 0.02),
         align_success=r.get("align_success", 0.95),
+        friction_noise=r.get("friction_noise", 0.0),
+        mass_noise=r.get("mass_noise", 0.0),
+        touch_noise=r.get("touch_noise", 0.0),
     )
 
 
@@ -69,23 +77,88 @@ def make_env(env_cfg: EnvConfig, rank: int, seed: int):
     return _init
 
 
-class RewardLogCallback(BaseCallback):
-    """Prints a compact rolling reward / alignment summary every N steps."""
+class MetricLogCallback(BaseCallback):
+    """Logs real task metrics every N steps so training is never blind.
+
+    Aggregates ``align / n_touching / solved / dropped`` from the per-env
+    ``info`` dicts (always printed, unlike the old buffer-gated logger).
+    """
 
     def __init__(self, log_interval: int = 8192, verbose: int = 1):
         super().__init__(verbose)
         self.log_interval = log_interval
         self._last_print = 0
+        self._reset_accumulator()
+
+    def _reset_accumulator(self) -> None:
+        self._acc_align = []
+        self._acc_touch = []
+        self._n_solved = 0
+        self._n_dropped = 0
+        self._n_term = 0
 
     def _on_step(self) -> bool:
+        # SB3 collects per-env terminal infos in self.locals["infos"].
+        for info in self.locals.get("infos", []):
+            if "align" not in info:
+                continue
+            self._acc_align.append(info["align"])
+            self._acc_touch.append(info["n_touching"])
+            self._n_term += 1
+            if info.get("solved"):
+                self._n_solved += 1
+            if info.get("dropped"):
+                self._n_dropped += 1
+
         if self.num_timesteps - self._last_print < self.log_interval:
             return True
         self._last_print = self.num_timesteps
-        if self.model.ep_info_buffer:
-            mean_r = float(np.mean([e["r"] for e in self.model.ep_info_buffer]))
-            mean_l = float(np.mean([e["l"] for e in self.model.ep_info_buffer]))
-            print(f"[{self.num_timesteps:>9d} steps] mean_ep_reward={mean_r:+.2f} "
-                  f"mean_ep_len={mean_l:.0f}", flush=True)
+        if self._acc_align:
+            n = len(self._acc_align)
+            mean_al = float(np.mean(self._acc_align))
+            max_al = float(np.max(self._acc_align))
+            mean_t = float(np.mean(self._acc_touch))
+            solve = self._n_solved / n
+            drop = self._n_dropped / n
+            ep_r = (float(np.mean([e["r"] for e in self.model.ep_info_buffer]))
+                    if self.model.ep_info_buffer else float("nan"))
+            print(f"[{self.num_timesteps:>9d}] ep_r={ep_r:+.2f} align={mean_al:.3f} "
+                  f"max={max_al:.3f} touch={mean_t:.2f} solve={solve:.0%} drop={drop:.0%}",
+                  flush=True)
+        else:
+            print(f"[{self.num_timesteps:>9d}] (no episodes terminated yet)", flush=True)
+        self._reset_accumulator()
+        return True
+
+
+class CurriculumCallback(BaseCallback):
+    """Anneal the grasp-assist weld length across training.
+
+    Early on the cube is held by the weld for most of the episode (easy: learn
+    to rotate while glued). Over the first ``anneal_steps`` we shrink
+    ``weld_steps`` from ``start`` to ``end`` so the policy must hold the cube by
+    real contacts. Operates on the underlying envs through ``vec_env.envs``.
+    """
+
+    def __init__(self, start_steps: int, end_steps: int, anneal_steps: int,
+                 verbose: int = 1):
+        super().__init__(verbose)
+        self.start_steps = start_steps
+        self.end_steps = end_steps
+        self.anneal_steps = anneal_steps
+
+    def _on_step(self) -> bool:
+        frac = min(1.0, self.num_timesteps / max(1, self.anneal_steps))
+        cur = int(round(self.start_steps + (self.end_steps - self.start_steps) * frac))
+        # VecNormalize wraps SubprocVecEnv; unwrap to reach the envs.
+        venv = self.model.get_vec_normalize_env() or self.model.env
+        try:
+            envs = venv.envs
+        except AttributeError:
+            return True
+        for e in envs:
+            base = getattr(e, "env", e)
+            base.env_config.weld_steps = cur
         return True
 
 
@@ -132,7 +205,21 @@ class TimestepCheckpointCallback(BaseCallback):
 def build_vec_env(cfg: dict, n_envs: int, seed: int) -> VecEnv:
     env_cfg = env_config_from_yaml(cfg)
     fns = [make_env(env_cfg, i, seed) for i in range(n_envs)]
-    return SubprocVecEnv(fns)
+    vec = SubprocVecEnv(fns)
+    # VecNormalize: running mean/std on obs + reward. Critical when the obs
+    # mixes rad, Newtons and quaternion components of very different scales.
+    vec = VecNormalize(vec, norm_obs=True, norm_reward=True, clip_obs=10.0, gamma=cfg["ppo"]["gamma"])
+    return vec
+
+
+def _as_schedule(value):
+    """Turn a scalar into a LinearSchedule decaying to 0; pass schedules through."""
+    if isinstance(value, str) and value.startswith("linear"):
+        start = float(value.split(":")[1])
+        # LinearSchedule(start, end, end_fraction): value goes start -> end over
+        # end_fraction of training. Decay to 0 at the very end.
+        return LinearSchedule(start, 0.0, 1.0)
+    return value
 
 
 def main() -> int:
@@ -175,14 +262,17 @@ def main() -> int:
         model = PPO(
             policy=ppo_cfg["policy"],
             env=vec_env,
-            learning_rate=ppo_cfg["learning_rate"],
+            learning_rate=_as_schedule(ppo_cfg["learning_rate"]),
             n_steps=ppo_cfg["n_steps"],
             batch_size=ppo_cfg["batch_size"],
-            n_epochs=ppo_cfg["n_epochs"],
+            n_epochs=ppo_cfg.get("n_epochs", 4),
             gamma=ppo_cfg["gamma"],
             gae_lambda=ppo_cfg["gae_lambda"],
-            clip_range=ppo_cfg["clip_range"],
+            clip_range=_as_schedule(ppo_cfg["clip_range"]),
             ent_coef=ppo_cfg.get("ent_coef", 0.0),
+            target_kl=ppo_cfg.get("target_kl", 0.03),
+            use_sde=ppo_cfg.get("use_sde", False),
+            sde_sample_freq=ppo_cfg.get("sde_sample_freq", 4),
             policy_kwargs=policy_kwargs,
             device=ppo_cfg["device"],
             seed=seed,
@@ -195,12 +285,18 @@ def main() -> int:
         save_dir=str(model_dir),
         name_prefix=model_name,
     )
-    reward_cb = RewardLogCallback(log_interval=8192)
+    metric_cb = MetricLogCallback(log_interval=8192)
+    curr_cfg = cfg.get("curriculum", {})
+    curriculum_cb = CurriculumCallback(
+        start_steps=curr_cfg.get("weld_start_steps", env_config_from_yaml(cfg).max_episode_steps),
+        end_steps=curr_cfg.get("weld_end_steps", 0),
+        anneal_steps=curr_cfg.get("weld_anneal_steps", 1_000_000),
+    )
 
     try:
         model.learn(
             total_timesteps=total,
-            callback=[checkpoint_cb, reward_cb],
+            callback=[checkpoint_cb, metric_cb, curriculum_cb],
             reset_num_timesteps=args.resume is None,
             progress_bar=False,
         )
@@ -209,6 +305,9 @@ def main() -> int:
 
     final_path = model_dir / f"{model_name}.zip"
     model.save(final_path)
+    # Save the VecNormalize stats alongside the model (needed to reload).
+    if hasattr(vec_env, "save"):
+        vec_env.save(str(model_dir / f"{model_name}_vecnorm.pkl"))
     vec_env.close()
     print(f"Saved final model -> {final_path}")
     return 0
