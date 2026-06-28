@@ -124,6 +124,14 @@ class InHandCubeEnv(gym.Env):
              for n in self.info["actuator_names"]],
             dtype=np.int32,
         )
+        # The 16 finger actuators (everything except the palm-lift actuator).
+        self._finger_act_ids = self._act_ids[
+            [i for i, n in enumerate(self.info["actuator_names"]) if n != "palm_lift_act"]
+        ]
+        self._lift_act_id = mujoco.mj_name2id(
+            self.model, mujoco.mjtObj.mjOBJ_ACTUATOR, "palm_lift_act"
+        )
+        self._has_palm_lift = self._lift_act_id >= 0
         self._joint_qadrs = np.array(
             [self.model.jnt_qposadr[mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, n)]
              for n in self.info["joint_names"]],
@@ -290,9 +298,14 @@ class InHandCubeEnv(gym.Env):
             "th_cmc": 0.6, "th_axl": 0.3, "th_mcp": 0.4, "th_ipl": 0.4,
         }
         for jn, adr in zip(self.info["joint_names"], self._joint_qadrs):
+            if jn not in rest:
+                continue  # skip palm_lift (set via its own actuator)
             self.data.qpos[adr] = rest[jn]
             aid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_ACTUATOR, jn + "_act")
             self.data.ctrl[aid] = rest[jn]
+        # zero the palm-lift ctrl (hand starts at rest height)
+        if self._has_palm_lift:
+            self.data.ctrl[self._lift_act_id] = 0.0
 
         # Spawn the cube with light noise around the nominal cradle pose.
         spawn = np.array(self.scene_config.cube_spawn_pos, dtype=np.float64)

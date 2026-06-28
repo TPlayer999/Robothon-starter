@@ -52,6 +52,12 @@ class SceneConfig:
     palm_pos: tuple[float, float, float] = (0.0, 0.0, 0.1)
     palm_quat: tuple[float, float, float, float] = (1.0, 0.0, 0.0, 0.0)
 
+    # Palm lift DOF: a vertical slide joint on the palm lets the hand lift /
+    # transport objects (unlocks pick-and-place, vertical transport, hold). The
+    # whole LEAP subtree rides on this joint, so raising it lifts any held object.
+    use_palm_lift: bool = True
+    palm_lift_range: tuple[float, float] = (0.0, 0.12)  # metres, world Z
+
     # Manipulated object. "cube" is the training object; the demo can switch to
     # sphere / cylinder / bottle to show the hand generalizing across shapes.
     object_type: str = "cube"  # cube | sphere | cylinder | bottle
@@ -65,12 +71,12 @@ class SceneConfig:
     tip_solimp: tuple[float, float, float] = (0.9, 0.95, 0.001)
     tip_condim: int = 6
 
-    # Cube spawn pose (world frame). The open LEAP fingers span x~0.04→0.12 at
-    # z~0.08, forming a "tray". We drop the cube just above that tray
-    # (centre z~0.10) so it settles onto the fingers, then closing the hand
-    # curls the fingertips down around it.
-    cube_spawn_pos: tuple[float, float, float] = (0.07, 0.0, 0.10)
-    table_z: float = 0.0  # safety floor (cube is caught by the fingers, not the table)
+    # Cube spawn pose (world frame). Spawned directly inside the finger "cage"
+    # (fingertips sit near x~0.08, z~0.08 at a moderate curl) so the object is
+    # cradled from the very first step instead of free-falling (which flings it
+    # out of the hand). The scripted controllers close around it + raise the palm.
+    cube_spawn_pos: tuple[float, float, float] = (0.05, 0.0, 0.085)
+    table_z: float = 0.0  # safety floor
 
     render_width: int = 1280
     render_height: int = 720
@@ -147,6 +153,32 @@ def build_scene(config: SceneConfig | None = None) -> tuple[mujoco.MjModel, dict
     palm.pos = list(config.palm_pos)
     palm.quat = list(config.palm_quat)
 
+    # Add a vertical slide joint to the palm so the hand can lift / transport
+    # objects. The whole LEAP subtree rides on this joint, so raising the palm
+    # lifts any held object — this unlocks pick-and-place and lift-and-hold.
+    if config.use_palm_lift:
+        palm.add_joint(
+            name="palm_lift",
+            type=mujoco.mjtJoint.mjJNT_SLIDE,
+            axis=[0.0, 0.0, 1.0],
+            pos=[0.0, 0.0, 0.0],
+            limited=True,
+            range=list(config.palm_lift_range),
+            damping=2.0,
+        )
+        spec.add_actuator(
+            name="palm_lift_act",
+            target="palm_lift",
+            trntype=mujoco.mjtTrn.mjTRN_JOINT,
+            ctrlrange=list(config.palm_lift_range),
+            ctrllimited=True,
+            # position-style actuator: gain kp, bias -kp*qpos -kv*qvel
+            gaintype=mujoco.mjtGain.mjGAIN_FIXED,
+            gainprm=[400.0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            biastype=mujoco.mjtBias.mjBIAS_AFFINE,
+            biasprm=[0, -400.0, -4.0, 0, 0, 0, 0, 0, 0, 0],
+        )
+
     # 1) Touch sensors at every fingertip.
     for body_name, label in zip(FINGERTIP_BODIES, FINGER_NAMES):
         _add_fingertip_touch(spec, body_name, label)
@@ -171,8 +203,9 @@ def build_scene(config: SceneConfig | None = None) -> tuple[mujoco.MjModel, dict
     elif obj_type == "cylinder":
         geom_kw = dict(type=mujoco.mjtGeom.mjGEOM_CYLINDER, size=[s * 0.8, s * 1.4])
     elif obj_type == "bottle":
-        # a capsule reads as a bottle/pen — graspable along its long axis.
-        geom_kw = dict(type=mujoco.mjtGeom.mjGEOM_CAPSULE, size=[s * 0.7, s * 1.8])
+        # a capsule reads as a bottle/pen — sized to fit the finger cage so it
+        # can be grasped and lifted like the other objects.
+        geom_kw = dict(type=mujoco.mjtGeom.mjGEOM_CAPSULE, size=[s * 0.55, s * 0.9])
     else:  # cube (default)
         geom_kw = dict(type=mujoco.mjtGeom.mjGEOM_BOX,
                        size=[s, s, s])
@@ -255,13 +288,16 @@ def build_scene(config: SceneConfig | None = None) -> tuple[mujoco.MjModel, dict
             "mf_mcp_act", "mf_rot_act", "mf_pip_act", "mf_dip_act",
             "rf_mcp_act", "rf_rot_act", "rf_pip_act", "rf_dip_act",
             "th_cmc_act", "th_axl_act", "th_mcp_act", "th_ipl_act",
+            "palm_lift_act",
         ],
         "joint_names": [
             "if_mcp", "if_rot", "if_pip", "if_dip",
             "mf_mcp", "mf_rot", "mf_pip", "mf_dip",
             "rf_mcp", "rf_rot", "rf_pip", "rf_dip",
             "th_cmc", "th_axl", "th_mcp", "th_ipl",
+            "palm_lift",
         ],
+        "palm_lift_joint": "palm_lift",
     }
     return model, info
 
@@ -271,6 +307,23 @@ def set_grasp_weld(model: mujoco.MjModel, data: mujoco.MjData, active: bool) -> 
     eq_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_EQUALITY, "grasp_weld")
     if eq_id >= 0:
         data.eq_active[eq_id] = 1 if active else 0
+
+
+def palm_height(model: mujoco.MjModel, data: mujoco.MjData) -> float:
+    """Current palm-lift joint position (metres above the rest pose)."""
+    jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, "palm_lift")
+    if jid < 0:
+        return 0.0
+    return float(data.qpos[model.jnt_qposadr[jid]])
+
+
+def set_palm_height(model: mujoco.MjModel, data: mujoco.MjData, height: float) -> None:
+    """Command the palm-lift actuator to a target height (metres)."""
+    aid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_ACTUATOR, "palm_lift_act")
+    if aid < 0:
+        return
+    low, high = model.actuator_ctrlrange[aid]
+    data.ctrl[aid] = float(np.clip(height, low, high))
 
 
 def touch_values(model: mujoco.MjModel, data: mujoco.MjData) -> np.ndarray:

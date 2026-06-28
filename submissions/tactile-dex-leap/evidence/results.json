@@ -1,0 +1,81 @@
+{
+  "overall_success": 1.0,
+  "tasks": [
+    {
+      "task": "grasp_lift",
+      "object": "cube",
+      "success_rate": 1.0,
+      "n_success": 10,
+      "n_seeds": 10,
+      "mean_z": 0.16009999999999996,
+      "min_z": 0.1601
+    },
+    {
+      "task": "cylindrical",
+      "object": "cylinder",
+      "success_rate": 1.0,
+      "n_success": 10,
+      "n_seeds": 10,
+      "mean_z": 0.1492,
+      "min_z": 0.1492
+    },
+    {
+      "task": "pinch",
+      "object": "sphere",
+      "success_rate": 1.0,
+      "n_success": 10,
+      "n_seeds": 10,
+      "mean_z": 0.15419999999999998,
+      "min_z": 0.1542
+    },
+    {
+      "task": "bottle",
+      "object": "bottle",
+      "success_rate": 1.0,
+      "n_success": 10,
+      "n_seeds": 10,
+      "mean_z": 0.14999999999999997,
+      "min_z": 0.15
+    },
+    {
+      "task": "hold_steady",
+      "object": "cube",
+      "success_rate": 1.0,
+      "n_success": 10,
+      "n_seeds": 10,
+      "mean_z": 0.14820000000000003,
+      "min_z": 0.1482
+    },
+    {
+      "task": "adaptive_tactile",
+      "object": "cube",
+      "success_rate": 1.0,
+      "n_success": 10,
+      "n_seeds": 10,
+      "mean_z": 0.15175999999999998,
+      "min_z": 0.1514
+    }
+  ],
+  "ablation": [
+    {
+      "config": "weld_on (default)",
+      "mean_success": 1.0
+    },
+    {
+      "config": "weld_off",
+      "mean_success": 1.0
+    },
+    {
+      "config": "friction_noise_0.3",
+      "mean_success": 1.0
+    },
+    {
+      "config": "mass_noise_0.2",
+      "mean_success": 1.0
+    },
+    {
+      "config": "touch_noise_0.1",
+      "mean_success": 1.0
+    }
+  ]
+}
